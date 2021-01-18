@@ -4,35 +4,33 @@ static khook_stub_t *khook_stub_tbl = NULL;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static int khook_lookup_cb(long data[], const char *name, void *module, long addr)
-{
-	int i = 0; while (!module && (((const char *)data[0]))[i] == name[i]) {
-		if (!name[i++]) return !!(data[1] = addr);
-	} return 0;
-}
+static long lookupName = 0;
+module_param(lookupName, long, 0);
 
-static void *khook_lookup_name(const char *name)
-{
-	long data[2] = { (long)name, 0 };
-	kallsyms_on_each_symbol((void *)khook_lookup_cb, data);
-	return (void *)data[1];
-}
+// kernel module loader STB_WEAK binding hack
+extern __attribute__((weak)) unsigned long kallsyms_lookup_name(const char *);
 
-static void *khook_map_writable(void *addr, size_t len)
+unsigned long khook_lookup_name(const char *name)
 {
-	struct page *pages[2] = { 0 }; // len << PAGE_SIZE
-	long page_offset = offset_in_page(addr);
-	int i, nb_pages = DIV_ROUND_UP(page_offset + len, PAGE_SIZE);
-
-	addr = (void *)((long)addr & PAGE_MASK);
-	for (i = 0; i < nb_pages; i++, addr += PAGE_SIZE) {
-		if ((pages[i] = is_vmalloc_addr(addr) ?
-		     vmalloc_to_page(addr) : virt_to_page(addr)) == NULL)
-			return NULL;
+	static typeof(khook_lookup_name) *lookup_name = kallsyms_lookup_name;
+#ifdef CONFIG_KPROBES
+	if (NULL == lookup_name) {
+		struct kprobe probe;
+		int callback(struct kprobe *p, struct pt_regs *regs) {
+			return 0;
+		}
+		memset(&probe, 0, sizeof(probe));
+		probe.pre_handler = callback;
+		probe.symbol_name = "kallsyms_lookup_name";
+		if (!register_kprobe(&probe)) {
+			lookup_name = (void *)probe.addr;
+			unregister_kprobe(&probe);
+		}
 	}
-
-	addr = vmap(pages, nb_pages, VM_MAP, PAGE_KERNEL);
-	return addr ? addr + page_offset : NULL;
+#endif
+	if (NULL == lookup_name)
+		lookup_name = (void *)lookupName;
+	return lookup_name ? lookup_name(name) : 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -59,7 +57,7 @@ static int khook_sm_init_hooks(void *arg)
 {
 	khook_t *p;
 	KHOOK_FOREACH_HOOK(p) {
-		if (!p->target.addr_map) continue;
+		if (!p->target.addr) continue;
 		khook_arch_sm_init_one(p);
 	}
 	return 0;
@@ -69,7 +67,7 @@ static int khook_sm_cleanup_hooks(void *arg)
 {
 	khook_t *p;
 	KHOOK_FOREACH_HOOK(p) {
-		if (!p->target.addr_map) continue;
+		if (!p->target.addr) continue;
 		khook_arch_sm_cleanup_one(p);
 	}
 	return 0;
@@ -79,34 +77,24 @@ static void khook_resolve(void)
 {
 	khook_t *p;
 	KHOOK_FOREACH_HOOK(p) {
-		p->target.addr = khook_lookup_name(p->target.name);
+		p->target.addr = (void *)khook_lookup_name(p->target.name);
+		if (!p->target.addr) printk("khook: failed to lookup %s symbol\n", p->target.name);
 	}
 }
 
-static void khook_map(void)
-{
-	khook_t *p;
-	KHOOK_FOREACH_HOOK(p) {
-		if (!p->target.addr) continue;
-		p->target.addr_map = khook_map_writable(p->target.addr, 32);
-		khook_debug("target %s@%p -> %p\n", p->target.name, p->target.addr, p->target.addr_map);
-	}
-}
-
-static void khook_unmap(int wait)
+static void khook_release(void)
 {
 	khook_t *p;
 	KHOOK_FOREACH_HOOK(p) {
 		khook_stub_t *stub = KHOOK_STUB(p);
-		if (!p->target.addr_map) continue;
-		while (wait && atomic_read(&stub->use_count) > 0) {
+		if (!p->target.addr) continue;
+		while (atomic_read(&stub->use_count) > 0) {
 			khook_wakeup();
 			msleep_interruptible(1000);
-			khook_debug("waiting for %s...\n", p->target.name);
+			printk("khook: waiting for %s...\n", p->target.name);
 		}
-		vunmap((void *)((long)p->target.addr_map & PAGE_MASK));
-		p->target.addr_map = NULL;
 	}
+	vfree(khook_stub_tbl);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -116,7 +104,7 @@ int khook_init(void)
 	void *(*malloc)(long size) = NULL;
 	int   (*set_memory_x)(unsigned long, int) = NULL;
 
-	malloc = khook_lookup_name("module_alloc");
+	malloc = (void *)khook_lookup_name("module_alloc");
 	if (!malloc || KHOOK_ARCH_INIT()) return -EINVAL;
 
 	khook_stub_tbl = malloc(KHOOK_STUB_TBL_SIZE);
@@ -129,25 +117,20 @@ int khook_init(void)
 	// region executable explicitly.
 	//
 
-	set_memory_x = khook_lookup_name("set_memory_x");
+	set_memory_x = (void *)khook_lookup_name("set_memory_x");
 	if (set_memory_x) {
 		int numpages = round_up(KHOOK_STUB_TBL_SIZE, PAGE_SIZE) / PAGE_SIZE;
 		set_memory_x((unsigned long)khook_stub_tbl, numpages);
 	}
 
 	khook_resolve();
-
-	khook_map();
-	stop_machine(khook_sm_init_hooks, NULL, NULL);
-	khook_unmap(0);
+	stop_machine(khook_sm_init_hooks, NULL, 0);
 
 	return 0;
 }
 
 void khook_cleanup(void)
 {
-	khook_map();
-	stop_machine(khook_sm_cleanup_hooks, NULL, NULL);
-	khook_unmap(1);
-	vfree(khook_stub_tbl);
+	stop_machine(khook_sm_cleanup_hooks, NULL, 0);
+	khook_release();
 }

@@ -8,8 +8,18 @@
 #include <linux/version.h>
 #include <linux/sched.h>
 
+#ifdef CONFIG_KPROBES
+# include <linux/kprobes.h>
+#endif
+
 #ifndef for_each_process
 # include <linux/sched/signal.h>
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 27)
+# define stop_machine stop_machine
+#else
+# define stop_machine stop_machine_run
 #endif
 
 #include "engine.h"
@@ -50,11 +60,4 @@ static khook_stub_t *khook_stub_tbl;
 # define KHOOK_STUB_FILE_NAME "stub.inc"
 #else
 # define KHOOK_STUB_FILE_NAME "stub32.inc"
-#endif
-
-#ifdef DEBUG
-# define khook_debug(fmt, ...)		\
-	pr_debug("[khook] " fmt, ##__VA_ARGS__)
-#else
-# define khook_debug(fmt, ...)
 #endif
